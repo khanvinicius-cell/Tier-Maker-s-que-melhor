@@ -9,10 +9,9 @@ class Tier(
     var color: Int,
     var rows: Int,
     val items: MutableList<String> = mutableListOf(),
-    var labelImage: String? = null
-) {
-    fun copy(): Tier = Tier(name, color, rows, items.toMutableList(), labelImage)
-}
+    var labelImage: String? = null,
+    var iconDp: Int = 64
+)
 
 class Theme(
     val name: String,
@@ -43,35 +42,35 @@ val PALETTE = listOf(
     "#FFEB3B", "#FFC107", "#FF9800", "#FF5722", "#795548", "#FF7F7F"
 )
 
+val FONT_NAMES = listOf("Padrão", "Serifada", "Monoespaçada", "Cursiva", "Casual", "Condensada", "Pesada")
+
 class TierState {
     var title = "Minha Tier List"
     var titleColor = Color.WHITE
+    var titleSize = 26
+    var titleFont = 0
+    var titleBold = true
+    var titleAlign = 1 // 0 esquerda, 1 centro, 2 direita
+    var titleImage: String? = null
+    var titleImageDp = 80
     var bgColor = Color.parseColor("#121212")
     var areaColor = Color.parseColor("#1F1F1F")
     var tierTextColor = Color.BLACK
     var hasBgImage = false
-    var iconDp = 64
+    var iconDp = 64 // tamanho dos ícones na área "sem tier"
     val tiers = mutableListOf<Tier>()
     val pool = mutableListOf<String>()
-
-    fun deepCopy(): TierState {
-        val s = TierState()
-        s.title = title
-        s.titleColor = titleColor
-        s.bgColor = bgColor
-        s.areaColor = areaColor
-        s.tierTextColor = tierTextColor
-        s.hasBgImage = hasBgImage
-        s.iconDp = iconDp
-        for (t in tiers) s.tiers.add(t.copy())
-        s.pool.addAll(pool)
-        return s
-    }
 
     fun toJson(): String {
         val o = JSONObject()
         o.put("title", title)
         o.put("titleColor", titleColor)
+        o.put("titleSize", titleSize)
+        o.put("titleFont", titleFont)
+        o.put("titleBold", titleBold)
+        o.put("titleAlign", titleAlign)
+        if (titleImage != null) o.put("titleImage", titleImage)
+        o.put("titleImageDp", titleImageDp)
         o.put("bgColor", bgColor)
         o.put("areaColor", areaColor)
         o.put("tierTextColor", tierTextColor)
@@ -83,6 +82,7 @@ class TierState {
             to.put("name", t.name)
             to.put("color", t.color)
             to.put("rows", t.rows)
+            to.put("iconDp", t.iconDp)
             to.put("items", JSONArray(t.items))
             if (t.labelImage != null) to.put("labelImage", t.labelImage)
             ta.put(to)
@@ -107,6 +107,13 @@ class TierState {
             val s = TierState()
             s.title = o.optString("title", s.title)
             s.titleColor = o.optInt("titleColor", s.titleColor)
+            s.titleSize = o.optInt("titleSize", s.titleSize)
+            s.titleFont = o.optInt("titleFont", 0)
+            s.titleBold = o.optBoolean("titleBold", true)
+            s.titleAlign = o.optInt("titleAlign", 1)
+            val ti = o.optString("titleImage", "")
+            if (ti.isNotEmpty()) s.titleImage = ti
+            s.titleImageDp = o.optInt("titleImageDp", 80)
             s.bgColor = o.optInt("bgColor", s.bgColor)
             s.areaColor = o.optInt("areaColor", s.areaColor)
             s.tierTextColor = o.optInt("tierTextColor", s.tierTextColor)
@@ -121,6 +128,7 @@ class TierState {
                         to.optInt("color", Color.GRAY),
                         to.optInt("rows", 1).coerceIn(1, 8)
                     )
+                    t.iconDp = to.optInt("iconDp", s.iconDp)
                     val ia = to.optJSONArray("items")
                     if (ia != null) for (j in 0 until ia.length()) t.items.add(ia.getString(j))
                     val li = to.optString("labelImage", "")

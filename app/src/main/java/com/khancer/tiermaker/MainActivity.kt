@@ -3,7 +3,6 @@ package com.khancer.tiermaker
 import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ContentValues
-import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -22,6 +21,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
@@ -60,9 +60,13 @@ class MainActivity : ComponentActivity() {
     private lateinit var boardFrame: FrameLayout
     private lateinit var bgView: CoverView
     private lateinit var titleView: TextView
+    private lateinit var titleImageView: ImageView
     private lateinit var tiersBox: LinearLayout
     private lateinit var poolFlow: FlowLayout
     private lateinit var poolHeader: TextView
+
+    /** Chamado quando uma imagem escolhida (tier ou título) termina de ser importada. */
+    private var pendingCb: ((String) -> Unit)? = null
 
     private val pickImages =
         registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
@@ -72,11 +76,13 @@ class MainActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
             if (uri != null) importBackground(uri)
         }
-
-    private var pendingLabelCb: ((String) -> Unit)? = null
     private val pickLabel =
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-            if (uri != null) importLabelImage(uri)
+            if (uri != null) importPicked(uri, true)
+        }
+    private val pickTitleImg =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+            if (uri != null) importPicked(uri, false)
         }
 
     private val stateFile: File get() = File(filesDir, "state.json")
@@ -109,27 +115,46 @@ class MainActivity : ComponentActivity() {
         content.setPadding(dp(8), dp(12), dp(8), dp(12))
 
         titleView = TextView(this)
-        titleView.gravity = Gravity.CENTER
-        titleView.textSize = 26f
-        titleView.setTypeface(Typeface.DEFAULT_BOLD)
         titleView.setPadding(dp(8), dp(4), dp(8), dp(12))
+        titleView.setOnLongClickListener { showTitleEditor(); true }
+
+        titleImageView = ImageView(this)
+        titleImageView.adjustViewBounds = true
+        titleImageView.scaleType = ImageView.ScaleType.FIT_CENTER
+        titleImageView.visibility = View.GONE
+        titleImageView.setOnLongClickListener { showTitleEditor(); true }
 
         tiersBox = LinearLayout(this)
         tiersBox.orientation = LinearLayout.VERTICAL
 
         content.addView(titleView, LinearLayout.LayoutParams(MATCH, WRAP))
+        content.addView(titleImageView, LinearLayout.LayoutParams(WRAP, dp(80)))
         content.addView(tiersBox, LinearLayout.LayoutParams(MATCH, WRAP))
         boardFrame.addView(content, FrameLayout.LayoutParams(MATCH, WRAP))
-        scroll.addView(boardFrame, ViewGroup.LayoutParams(MATCH, WRAP))
+        boardFrame.setOnLongClickListener { showBackgroundEditor(); true }
+
+        val wrapper = vbox()
+        wrapper.addView(boardFrame, LinearLayout.LayoutParams(MATCH, WRAP))
+        val addTierLp = LinearLayout.LayoutParams(MATCH, WRAP)
+        addTierLp.setMargins(dp(8), dp(8), dp(8), dp(8))
+        wrapper.addView(button("+ Adicionar tier") { addTier() }, addTierLp)
+        scroll.addView(wrapper, ViewGroup.LayoutParams(MATCH, WRAP))
 
         root.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
-        root.addView(buildPool(), LinearLayout.LayoutParams(MATCH, dp(170)))
+        root.addView(buildPool(), LinearLayout.LayoutParams(MATCH, dp(150)))
+        root.addView(buildBottomBar(), LinearLayout.LayoutParams(MATCH, WRAP))
         setContentView(root)
 
         if (state.hasBgImage && bgFile.exists()) {
             bgBitmap = BitmapFactory.decodeFile(bgFile.path)
         }
         rebuild()
+
+        val prefs = getSharedPreferences("tm", MODE_PRIVATE)
+        if (!prefs.getBoolean("hint", false)) {
+            prefs.edit().putBoolean("hint", true).apply()
+            Toast.makeText(this, "Dica: segure um tier, o título ou o fundo para editar", Toast.LENGTH_LONG).show()
+        }
     }
 
     // ------------------------------------------------------------------ helpers de UI
@@ -169,6 +194,12 @@ class MainActivity : ComponentActivity() {
         return l
     }
 
+    private fun dialogBox(): LinearLayout {
+        val b = vbox()
+        b.setPadding(dp(16), dp(8), dp(16), dp(8))
+        return b
+    }
+
     private fun swatch(color: Int, onClick: () -> Unit): View {
         val v = View(this)
         val g = GradientDrawable()
@@ -188,14 +219,50 @@ class MainActivity : ComponentActivity() {
         return t
     }
 
+    /** Linha "nome + quadradinho de cor". O quadradinho se atualiza sozinho ao escolher. */
+    private fun colorRow(text: String, getColor: () -> Int, onPick: (Int) -> Unit): View {
+        val r = hbox()
+        r.setPadding(0, dp(4), 0, dp(4))
+        r.addView(label(text, 15f), LinearLayout.LayoutParams(0, WRAP, 1f))
+        val sw = swatch(getColor()) {}
+        sw.setOnClickListener {
+            pickColor(getColor()) { c ->
+                onPick(c)
+                (sw.background as GradientDrawable).setColor(c)
+            }
+        }
+        r.addView(sw, LinearLayout.LayoutParams(dp(48), dp(36)))
+        return r
+    }
+
+    private fun addSeek(
+        box: LinearLayout, title: String, unit: String,
+        minV: Int, maxV: Int, value: Int, live: Boolean, onChange: (Int) -> Unit
+    ) {
+        val lbl = label("$title: $value $unit", 14f)
+        val sb = SeekBar(this)
+        sb.max = maxV - minV
+        sb.progress = (value - minV).coerceIn(0, maxV - minV)
+        sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                lbl.text = "$title: ${minV + p} $unit"
+                if (live && fromUser) onChange(minV + p)
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {
+                if (!live) onChange(minV + (s?.progress ?: 0))
+            }
+        })
+        box.addView(lbl)
+        box.addView(sb)
+    }
+
     private fun buildTopBar(): View {
         val bar = LinearLayout(this)
         bar.orientation = LinearLayout.HORIZONTAL
         bar.setBackgroundColor(0xFF1A1A1A.toInt())
         bar.setPadding(dp(4), dp(4), dp(4), dp(4))
-        bar.addView(button("+ Imagens") { pickImages.launch("image/*") }, LinearLayout.LayoutParams(0, WRAP, 1f))
-        bar.addView(button("Ajustes") { showSettings() }, LinearLayout.LayoutParams(0, WRAP, 1f))
-        bar.addView(button("Exportar") { showExportMenu() }, LinearLayout.LayoutParams(0, WRAP, 1f))
+        bar.addView(button("Salvar imagem") { saveImage() }, LinearLayout.LayoutParams(MATCH, WRAP))
         return bar
     }
 
@@ -219,25 +286,110 @@ class MainActivity : ComponentActivity() {
         return panel
     }
 
+    private fun buildBottomBar(): View {
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        bar.gravity = Gravity.CENTER_VERTICAL
+        bar.setBackgroundColor(0xFF1A1A1A.toInt())
+        bar.setPadding(dp(4), dp(4), dp(4), dp(4))
+        bar.addView(button("Adicionar imagens") { pickImages.launch("image/*") }, LinearLayout.LayoutParams(0, WRAP, 1f))
+
+        val trash = TextView(this)
+        trash.text = "🗑 Lixeira"
+        trash.textSize = 14f
+        trash.setTextColor(Color.WHITE)
+        trash.gravity = Gravity.CENTER
+        trash.setPadding(dp(14), dp(12), dp(14), dp(12))
+        val g = GradientDrawable()
+        g.cornerRadius = dp(6).toFloat()
+        g.setColor(0xFF7A1F1F.toInt())
+        trash.background = g
+        trash.setOnDragListener { v, ev ->
+            when (ev.action) {
+                DragEvent.ACTION_DRAG_STARTED -> true
+                DragEvent.ACTION_DRAG_ENTERED -> {
+                    v.alpha = 0.6f
+                    true
+                }
+                DragEvent.ACTION_DRAG_EXITED, DragEvent.ACTION_DRAG_ENDED -> {
+                    v.alpha = 1f
+                    true
+                }
+                DragEvent.ACTION_DROP -> {
+                    v.alpha = 1f
+                    val id = ev.clipData.getItemAt(0).text.toString()
+                    ui.post { removeItem(id) }
+                    true
+                }
+                else -> true
+            }
+        }
+        val lp = LinearLayout.LayoutParams(WRAP, WRAP)
+        lp.leftMargin = dp(8)
+        bar.addView(trash, lp)
+        return bar
+    }
+
     // ------------------------------------------------------------------ montagem da lista
 
     private fun rebuild() {
         boardFrame.setBackgroundColor(state.bgColor)
         bgView.bitmap = bgBitmap
-        titleView.text = state.title
-        titleView.setTextColor(state.titleColor)
-        titleView.visibility = if (state.title.isBlank()) View.GONE else View.VISIBLE
+        refreshTitle()
 
         tiersBox.removeAllViews()
         for (tier in state.tiers) tiersBox.addView(buildTierRow(tier))
 
         poolFlow.removeAllViews()
-        for (id in state.pool) poolFlow.addView(makeIcon(id))
-        poolHeader.text = "Sem tier (${state.pool.size}) - toque e segure para arrastar"
+        for (id in state.pool) poolFlow.addView(makeIcon(id, dp(state.iconDp)))
+        poolHeader.text = "Sem tier (${state.pool.size}) - segure uma imagem e arraste"
+    }
+
+    private fun titleTypeface(): Typeface {
+        val family = when (state.titleFont) {
+            1 -> "serif"
+            2 -> "monospace"
+            3 -> "cursive"
+            4 -> "casual"
+            5 -> "sans-serif-condensed"
+            6 -> "sans-serif-black"
+            else -> "sans-serif"
+        }
+        return Typeface.create(family, if (state.titleBold) Typeface.BOLD else Typeface.NORMAL)
+    }
+
+    private fun refreshTitle() {
+        val imgId = state.titleImage
+        val bmp = if (imgId != null) getBitmap(imgId) else null
+        if (bmp != null) {
+            titleView.visibility = View.GONE
+            titleImageView.setImageBitmap(bmp)
+            val lp = LinearLayout.LayoutParams(WRAP, dp(state.titleImageDp))
+            lp.gravity = when (state.titleAlign) {
+                0 -> Gravity.START
+                2 -> Gravity.END
+                else -> Gravity.CENTER_HORIZONTAL
+            }
+            lp.bottomMargin = dp(12)
+            titleImageView.layoutParams = lp
+            titleImageView.visibility = View.VISIBLE
+        } else {
+            titleImageView.visibility = View.GONE
+            titleView.text = state.title
+            titleView.setTextColor(state.titleColor)
+            titleView.textSize = state.titleSize.toFloat()
+            titleView.setTypeface(titleTypeface())
+            titleView.gravity = when (state.titleAlign) {
+                0 -> Gravity.START
+                2 -> Gravity.END
+                else -> Gravity.CENTER_HORIZONTAL
+            }
+            titleView.visibility = if (state.title.isBlank()) View.GONE else View.VISIBLE
+        }
     }
 
     private fun buildTierRow(tier: Tier): View {
-        val cell = dp(state.iconDp)
+        val cell = dp(tier.iconDp)
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
 
@@ -266,10 +418,11 @@ class MainActivity : ComponentActivity() {
         val flow = FlowLayout(this)
         flow.setBackgroundColor(state.areaColor)
         flow.minimumHeight = tier.rows * cell
-        for (id in tier.items) flow.addView(makeIcon(id))
+        for (id in tier.items) flow.addView(makeIcon(id, cell))
         row.addView(flow, LinearLayout.LayoutParams(0, WRAP, 1f))
 
         row.setOnDragListener(makeDropListener(tier.items, flow))
+        row.setOnLongClickListener { showTierEditor(tier); true }
 
         val lp = LinearLayout.LayoutParams(MATCH, WRAP)
         lp.bottomMargin = dp(3)
@@ -278,8 +431,7 @@ class MainActivity : ComponentActivity() {
     }
 
     /** Todo ícone é uma célula quadrada (1x1) com a imagem em center-crop. */
-    private fun makeIcon(id: String): View {
-        val cell = dp(state.iconDp)
+    private fun makeIcon(id: String, cell: Int): View {
         val iv = ImageView(this)
         iv.scaleType = ImageView.ScaleType.CENTER_CROP
         iv.layoutParams = ViewGroup.LayoutParams(cell, cell)
@@ -301,6 +453,11 @@ class MainActivity : ComponentActivity() {
         val b = BitmapFactory.decodeFile(f.path) ?: return null
         cache[id] = b
         return b
+    }
+
+    private fun deleteImage(id: String) {
+        cache.remove(id)
+        File(imgDir, "$id.png").delete()
     }
 
     // ------------------------------------------------------------------ arrastar e soltar
@@ -360,8 +517,7 @@ class MainActivity : ComponentActivity() {
 
     private fun removeItem(id: String) {
         findList(id)?.remove(id)
-        cache.remove(id)
-        File(imgDir, "$id.png").delete()
+        deleteImage(id)
         saveState()
         rebuild()
     }
@@ -430,14 +586,31 @@ class MainActivity : ComponentActivity() {
         return if (s != size) Bitmap.createScaledBitmap(square, size, size, true) else square
     }
 
-    private fun importLabelImage(uri: Uri) {
+    /** Mantém a proporção original, só reduzindo se o lado maior passar de maxSide. */
+    private fun decodeFit(uri: Uri, maxSide: Int): Bitmap {
+        val src = ImageDecoder.createSource(contentResolver, uri)
+        return ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
+            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+            val m = max(info.size.width, info.size.height)
+            if (m > maxSide) {
+                val f = maxSide.toFloat() / m
+                decoder.setTargetSize(
+                    max(1, (info.size.width * f).roundToInt()),
+                    max(1, (info.size.height * f).roundToInt())
+                )
+            }
+        }
+    }
+
+    /** Imagem do tier (quadrada) ou do título (proporção original); devolve o id via pendingCb. */
+    private fun importPicked(uri: Uri, square: Boolean) {
         io.execute {
             try {
-                val bmp = decodeSquare(uri, 256)
+                val bmp = if (square) decodeSquare(uri, 256) else decodeFit(uri, 1200)
                 val id = UUID.randomUUID().toString()
                 FileOutputStream(File(imgDir, "$id.png")).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
                 cache[id] = bmp
-                ui.post { pendingLabelCb?.invoke(id) }
+                ui.post { pendingCb?.invoke(id) }
             } catch (e: Exception) {
                 ui.post { toast("Não foi possível usar essa imagem") }
             }
@@ -447,18 +620,7 @@ class MainActivity : ComponentActivity() {
     private fun importBackground(uri: Uri) {
         io.execute {
             try {
-                val src = ImageDecoder.createSource(contentResolver, uri)
-                val bmp = ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
-                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-                    val m = max(info.size.width, info.size.height)
-                    if (m > 1600) {
-                        val f = 1600f / m
-                        decoder.setTargetSize(
-                            max(1, (info.size.width * f).roundToInt()),
-                            max(1, (info.size.height * f).roundToInt())
-                        )
-                    }
-                }
+                val bmp = decodeFit(uri, 1600)
                 FileOutputStream(bgFile).use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
                 ui.post {
                     bgBitmap = bmp
@@ -498,7 +660,254 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ------------------------------------------------------------------ ajustes
+    // ------------------------------------------------------------------ editar tier (segurar o tier)
+
+    private fun addTier() {
+        val c = Color.parseColor(CLASSIC[state.tiers.size % CLASSIC.size])
+        val size = if (state.tiers.isNotEmpty()) state.tiers.last().iconDp else state.iconDp
+        val t = Tier("Novo", c, 1)
+        t.iconDp = size
+        state.tiers.add(t)
+        saveState()
+        rebuild()
+        showTierEditor(t)
+        scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    private fun deleteTier(t: Tier) {
+        state.pool.addAll(t.items)
+        val li = t.labelImage
+        if (li != null) deleteImage(li)
+        state.tiers.remove(t)
+        saveState()
+        rebuild()
+    }
+
+    private fun showTierEditor(t: Tier) {
+        val box = dialogBox()
+        val sv = ScrollView(this)
+        sv.addView(box)
+
+        box.addView(section("Nome do tier"))
+        val nameEdit = EditText(this)
+        nameEdit.setText(t.name)
+        nameEdit.hint = "Nome"
+        nameEdit.setSingleLine()
+        nameEdit.doAfterTextChanged {
+            t.name = it?.toString() ?: ""
+            saveState()
+            rebuild()
+        }
+        box.addView(nameEdit)
+
+        box.addView(section("Cor do tier"))
+        box.addView(colorRow("Cor", { t.color }) {
+            t.color = it
+            saveState()
+            rebuild()
+        })
+
+        box.addView(section("Imagens neste tier"))
+        addSeek(box, "Tamanho dos ícones", "dp", 40, 140, t.iconDp, false) {
+            t.iconDp = it
+            saveState()
+            rebuild()
+        }
+
+        val rowsLabel = label(" ${t.rows} ", 16f, true)
+        val rowsBox = hbox()
+        rowsBox.addView(label("Espaço (linhas de ícones): ", 14f))
+        rowsBox.addView(button("−") {
+            if (t.rows > 1) {
+                t.rows--
+                rowsLabel.text = " ${t.rows} "
+                saveState()
+                rebuild()
+            }
+        })
+        rowsBox.addView(rowsLabel)
+        rowsBox.addView(button("+") {
+            if (t.rows < 8) {
+                t.rows++
+                rowsLabel.text = " ${t.rows} "
+                saveState()
+                rebuild()
+            }
+        })
+        box.addView(rowsBox)
+
+        box.addView(section("Imagem do tier (barra lateral)"))
+        val imgInfo = label(if (t.labelImage != null) "Imagem definida" else "Sem imagem", 14f)
+        box.addView(imgInfo)
+        val imgRow = hbox()
+        imgRow.addView(button("Adicionar / trocar") {
+            pendingCb = { id ->
+                val old = t.labelImage
+                t.labelImage = id
+                if (old != null) deleteImage(old)
+                imgInfo.text = "Imagem definida"
+                saveState()
+                rebuild()
+            }
+            pickLabel.launch("image/*")
+        })
+        imgRow.addView(button("Remover") {
+            val old = t.labelImage
+            if (old != null) {
+                t.labelImage = null
+                deleteImage(old)
+                imgInfo.text = "Sem imagem"
+                saveState()
+                rebuild()
+            }
+        })
+        box.addView(imgRow)
+
+        box.addView(section("Ordem"))
+        val moveRow = hbox()
+        moveRow.addView(button("▲ Subir") {
+            val i = state.tiers.indexOf(t)
+            if (i > 0) {
+                Collections.swap(state.tiers, i, i - 1)
+                saveState()
+                rebuild()
+            }
+        })
+        moveRow.addView(button("▼ Descer") {
+            val i = state.tiers.indexOf(t)
+            if (i >= 0 && i < state.tiers.size - 1) {
+                Collections.swap(state.tiers, i, i + 1)
+                saveState()
+                rebuild()
+            }
+        })
+        box.addView(moveRow)
+
+        AlertDialog.Builder(this)
+            .setTitle("Editar tier")
+            .setView(sv)
+            .setPositiveButton("Concluído", null)
+            .setNeutralButton("Excluir tier") { _, _ ->
+                AlertDialog.Builder(this)
+                    .setTitle("Excluir este tier?")
+                    .setMessage("As imagens dele voltam para \"sem tier\".")
+                    .setPositiveButton("Excluir") { _, _ -> deleteTier(t) }
+                    .setNegativeButton("Cancelar", null)
+                    .show()
+            }
+            .show()
+    }
+
+    // ------------------------------------------------------------------ editar título (segurar o título)
+
+    private fun showTitleEditor() {
+        val box = dialogBox()
+        val sv = ScrollView(this)
+        sv.addView(box)
+
+        box.addView(section("Texto"))
+        val edit = EditText(this)
+        edit.setText(state.title)
+        edit.hint = "Título"
+        edit.doAfterTextChanged {
+            state.title = it?.toString() ?: ""
+            saveState()
+            refreshTitle()
+        }
+        box.addView(edit)
+
+        box.addView(section("Fonte"))
+        val fontBtns = ArrayList<Button>()
+        val hs = HorizontalScrollView(this)
+        val fontRow = hbox()
+        FONT_NAMES.forEachIndexed { i, n ->
+            val b = button(n) {
+                state.titleFont = i
+                saveState()
+                refreshTitle()
+                fontBtns.forEachIndexed { j, bb -> bb.alpha = if (j == i) 1f else 0.5f }
+            }
+            b.alpha = if (state.titleFont == i) 1f else 0.5f
+            fontBtns.add(b)
+            fontRow.addView(b)
+        }
+        hs.addView(fontRow)
+        box.addView(hs)
+
+        val bold = CheckBox(this)
+        bold.text = "Negrito"
+        bold.isChecked = state.titleBold
+        bold.setOnCheckedChangeListener { _, c ->
+            state.titleBold = c
+            saveState()
+            refreshTitle()
+        }
+        box.addView(bold)
+
+        box.addView(section("Cor e tamanho"))
+        box.addView(colorRow("Cor do texto", { state.titleColor }) {
+            state.titleColor = it
+            saveState()
+            refreshTitle()
+        })
+        addSeek(box, "Tamanho do texto", "sp", 14, 60, state.titleSize, true) {
+            state.titleSize = it
+            saveState()
+            refreshTitle()
+        }
+
+        box.addView(section("Posicionamento"))
+        val alignRow = hbox()
+        val alignNames = listOf("Esquerda", "Centro", "Direita")
+        alignNames.forEachIndexed { i, n ->
+            alignRow.addView(button(n) {
+                state.titleAlign = i
+                saveState()
+                refreshTitle()
+            })
+        }
+        box.addView(alignRow)
+
+        box.addView(section("Imagem personalizada (no lugar do texto)"))
+        val imgInfo = label(if (state.titleImage != null) "Usando imagem" else "Usando texto", 14f)
+        box.addView(imgInfo)
+        val imgRow = hbox()
+        imgRow.addView(button("Escolher / trocar") {
+            pendingCb = { id ->
+                val old = state.titleImage
+                state.titleImage = id
+                if (old != null) deleteImage(old)
+                imgInfo.text = "Usando imagem"
+                saveState()
+                refreshTitle()
+            }
+            pickTitleImg.launch("image/*")
+        })
+        imgRow.addView(button("Voltar ao texto") {
+            val old = state.titleImage
+            if (old != null) {
+                state.titleImage = null
+                deleteImage(old)
+                imgInfo.text = "Usando texto"
+                saveState()
+                refreshTitle()
+            }
+        })
+        box.addView(imgRow)
+        addSeek(box, "Altura da imagem", "dp", 40, 300, state.titleImageDp, true) {
+            state.titleImageDp = it
+            saveState()
+            refreshTitle()
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Editar título")
+            .setView(sv)
+            .setPositiveButton("Concluído", null)
+            .show()
+    }
+
+    // ------------------------------------------------------------------ editar fundo e tema (segurar o fundo)
 
     private fun applyTheme(s: TierState, t: Theme) {
         s.bgColor = Color.parseColor(t.bg)
@@ -510,167 +919,139 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun commitSettings(d: TierState) {
-        state.title = d.title
-        state.titleColor = d.titleColor
-        state.bgColor = d.bgColor
-        state.areaColor = d.areaColor
-        state.tierTextColor = d.tierTextColor
-        state.iconDp = d.iconDp
-        val oldLabels = state.tiers.mapNotNull { it.labelImage }
-        state.tiers.clear()
-        state.tiers.addAll(d.tiers)
-        state.pool.clear()
-        state.pool.addAll(d.pool)
-        val newLabels = state.tiers.mapNotNull { it.labelImage }
-        for (id in oldLabels) {
-            if (id !in newLabels) {
-                cache.remove(id)
-                File(imgDir, "$id.png").delete()
-            }
-        }
-        saveState()
-        rebuild()
-    }
-
-    private fun colorRow(text: String, color: Int, onPick: (Int) -> Unit): View {
-        val r = hbox()
-        r.setPadding(0, dp(4), 0, dp(4))
-        r.addView(label(text, 15f), LinearLayout.LayoutParams(0, WRAP, 1f))
-        r.addView(swatch(color) { pickColor(color, onPick) }, LinearLayout.LayoutParams(dp(48), dp(36)))
-        return r
-    }
-
-    private fun showSettings() {
-        val draft = state.deepCopy()
-        val container = vbox()
-        container.setPadding(dp(16), dp(8), dp(16), dp(8))
+    private fun showBackgroundEditor() {
+        val box = dialogBox()
         val sv = ScrollView(this)
-        sv.addView(container)
+        sv.addView(box)
 
         fun render() {
             val keepY = sv.scrollY
-            container.removeAllViews()
+            box.removeAllViews()
 
-            container.addView(section("Título da lista"))
-            val titleEdit = EditText(this)
-            titleEdit.setText(draft.title)
-            titleEdit.hint = "Título"
-            titleEdit.doAfterTextChanged { draft.title = it?.toString() ?: "" }
-            container.addView(titleEdit)
-
-            container.addView(section("Tema pronto"))
+            box.addView(section("Tema pronto"))
             val hs = HorizontalScrollView(this)
             val themeRow = hbox()
-            for (t in THEMES) themeRow.addView(button(t.name) { applyTheme(draft, t); render() })
+            for (t in THEMES) {
+                themeRow.addView(button(t.name) {
+                    applyTheme(state, t)
+                    saveState()
+                    rebuild()
+                    render()
+                })
+            }
             hs.addView(themeRow)
-            container.addView(hs)
+            box.addView(hs)
 
-            container.addView(section("Cores"))
-            container.addView(colorRow("Plano de fundo", draft.bgColor) { draft.bgColor = it; render() })
-            container.addView(colorRow("Fonte do título", draft.titleColor) { draft.titleColor = it; render() })
-            container.addView(colorRow("Fonte dos tiers", draft.tierTextColor) { draft.tierTextColor = it; render() })
-            container.addView(colorRow("Área dos tiers", draft.areaColor) { draft.areaColor = it; render() })
+            box.addView(section("Cores"))
+            box.addView(colorRow("Plano de fundo", { state.bgColor }) {
+                state.bgColor = it
+                saveState()
+                rebuild()
+            })
+            box.addView(colorRow("Fonte dos tiers", { state.tierTextColor }) {
+                state.tierTextColor = it
+                saveState()
+                rebuild()
+            })
+            box.addView(colorRow("Área dos tiers", { state.areaColor }) {
+                state.areaColor = it
+                saveState()
+                rebuild()
+            })
 
-            container.addView(section("Imagem de fundo"))
+            box.addView(section("Imagem de fundo"))
             val bgRow = hbox()
             bgRow.addView(button("Escolher imagem") { pickBg.launch("image/*") })
             bgRow.addView(button("Remover") { removeBackground() })
-            container.addView(bgRow)
+            box.addView(bgRow)
 
-            container.addView(section("Tamanho dos ícones"))
-            val sizeLabel = label("${draft.iconDp} dp", 14f)
-            val seek = SeekBar(this)
-            seek.max = 80
-            seek.progress = draft.iconDp - 40
-            seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                    draft.iconDp = 40 + p
-                    sizeLabel.text = "${draft.iconDp} dp"
-                }
-                override fun onStartTrackingTouch(s: SeekBar?) {}
-                override fun onStopTrackingTouch(s: SeekBar?) {}
-            })
-            container.addView(sizeLabel)
-            container.addView(seek)
-
-            container.addView(section("Tiers (${draft.tiers.size})"))
-            draft.tiers.forEachIndexed { i, t ->
-                val card = vbox()
-                card.setPadding(0, dp(8), 0, dp(8))
-
-                val r1 = hbox()
-                r1.addView(swatch(t.color) { pickColor(t.color) { c -> t.color = c; render() } },
-                    LinearLayout.LayoutParams(dp(40), dp(40)))
-                val nameEdit = EditText(this)
-                nameEdit.setText(t.name)
-                nameEdit.setSingleLine()
-                nameEdit.hint = "Nome"
-                nameEdit.doAfterTextChanged { t.name = it?.toString() ?: "" }
-                r1.addView(nameEdit, LinearLayout.LayoutParams(0, WRAP, 1f))
-                r1.addView(button("▲") { if (i > 0) { Collections.swap(draft.tiers, i, i - 1); render() } })
-                r1.addView(button("▼") { if (i < draft.tiers.size - 1) { Collections.swap(draft.tiers, i, i + 1); render() } })
-                r1.addView(button("✕") {
-                    draft.pool.addAll(t.items)
-                    draft.tiers.removeAt(i)
-                    render()
-                })
-                card.addView(r1)
-
-                val r2 = hbox()
-                r2.addView(label("Espaço (linhas de ícones): ", 14f))
-                r2.addView(button("−") { if (t.rows > 1) { t.rows--; render() } })
-                r2.addView(label(" ${t.rows} ", 16f, true))
-                r2.addView(button("+") { if (t.rows < 8) { t.rows++; render() } })
-                card.addView(r2)
-
-                val r3 = hbox()
-                r3.addView(button(if (t.labelImage == null) "+ Imagem do tier" else "Trocar imagem") {
-                    pendingLabelCb = { id -> t.labelImage = id; render() }
-                    pickLabel.launch("image/*")
-                })
-                if (t.labelImage != null) {
-                    r3.addView(button("Remover imagem") { t.labelImage = null; render() })
-                }
-                card.addView(r3)
-
-                container.addView(card)
-            }
-
-            container.addView(button("+ Adicionar tier") {
-                val c = Color.parseColor(CLASSIC[draft.tiers.size % CLASSIC.size])
-                draft.tiers.add(Tier("Novo", c, 1))
-                render()
-            })
-            container.addView(button("Devolver todas as imagens para \"sem tier\"") {
-                for (t in draft.tiers) {
-                    draft.pool.addAll(t.items)
-                    t.items.clear()
-                }
-                toast("Feito. Toque em Aplicar para confirmar.")
-            })
+            box.addView(section("Título"))
+            box.addView(button("Editar título") { showTitleEditor() })
 
             sv.post { sv.scrollTo(0, keepY) }
         }
 
         render()
         AlertDialog.Builder(this)
-            .setTitle("Ajustes")
+            .setTitle("Fundo e tema")
             .setView(sv)
-            .setPositiveButton("Aplicar") { _, _ -> commitSettings(draft) }
-            .setNegativeButton("Cancelar", null)
+            .setPositiveButton("Concluído", null)
             .show()
     }
 
     private fun pickColor(initial: Int, onPick: (Int) -> Unit) {
-        val box = vbox()
-        box.setPadding(dp(16), dp(8), dp(16), dp(8))
+        val box = dialogBox()
+        val sv = ScrollView(this)
+        sv.addView(box)
+
+        var current = initial or 0xFF000000.toInt()
+        var updating = false
+
+        val wheel = ColorWheelView(this)
+        val bright = SeekBar(this)
+        bright.max = 100
         val hex = EditText(this)
         hex.hint = "#RRGGBB"
         hex.setSingleLine()
-        hex.setText(String.format("#%06X", initial and 0xFFFFFF))
+        val preview = swatch(current) {}
 
-        var dlg: AlertDialog? = null
+        // source: 0 = círculo, 1 = brilho, 2 = código hex, 3 = paleta
+        fun refresh(c: Int, source: Int) {
+            updating = true
+            current = c
+            (preview.background as GradientDrawable).setColor(c)
+            if (source != 2) hex.setText(String.format("#%06X", c and 0xFFFFFF))
+            if (source >= 2) {
+                wheel.setColor(c)
+                bright.progress = (wheel.value * 100f).roundToInt()
+            }
+            updating = false
+        }
+
+        wheel.setColor(current)
+        bright.progress = (wheel.value * 100f).roundToInt()
+        hex.setText(String.format("#%06X", current and 0xFFFFFF))
+
+        wheel.onChange = { c -> refresh(c, 0) }
+        bright.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                if (fromUser) {
+                    wheel.value = p / 100f
+                    wheel.invalidate()
+                    refresh(wheel.currentColor(), 1)
+                }
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        hex.doAfterTextChanged {
+            if (!updating) {
+                val t = it?.toString()?.trim() ?: ""
+                if (t.length == 7 && t[0] == '#') {
+                    try {
+                        refresh(Color.parseColor(t), 2)
+                    } catch (e: Exception) {
+                        // código ainda incompleto ou inválido
+                    }
+                }
+            }
+        }
+
+        val wheelLp = LinearLayout.LayoutParams(dp(240), dp(240))
+        wheelLp.gravity = Gravity.CENTER_HORIZONTAL
+        box.addView(wheel, wheelLp)
+
+        box.addView(label("Brilho (exposição): arraste para escurecer", 13f))
+        box.addView(bright)
+
+        val hexRow = hbox()
+        hexRow.addView(preview, LinearLayout.LayoutParams(dp(48), dp(40)))
+        val hexLp = LinearLayout.LayoutParams(0, WRAP, 1f)
+        hexLp.leftMargin = dp(12)
+        hexRow.addView(hex, hexLp)
+        box.addView(hexRow)
+
+        box.addView(section("Cores rápidas"))
         val colors = PALETTE.map { Color.parseColor(it) }
         for (r in 0 until 4) {
             val row = LinearLayout(this)
@@ -678,40 +1059,22 @@ class MainActivity : ComponentActivity() {
             row.gravity = Gravity.CENTER
             for (c in 0 until 6) {
                 val col = colors[r * 6 + c]
-                val lp = LinearLayout.LayoutParams(dp(44), dp(44))
+                val lp = LinearLayout.LayoutParams(dp(40), dp(40))
                 lp.setMargins(dp(4), dp(4), dp(4), dp(4))
-                row.addView(swatch(col) {
-                    dlg?.dismiss()
-                    onPick(col)
-                }, lp)
+                row.addView(swatch(col) { refresh(col, 3) }, lp)
             }
             box.addView(row)
         }
-        box.addView(hex)
 
-        dlg = AlertDialog.Builder(this)
-            .setTitle("Escolher cor")
-            .setView(box)
-            .setPositiveButton("OK") { _, _ ->
-                try {
-                    onPick(Color.parseColor(hex.text.toString().trim()))
-                } catch (e: Exception) {
-                    toast("Cor inválida")
-                }
-            }
-            .setNegativeButton("Cancelar", null)
-            .create()
-        dlg?.show()
-    }
-
-    // ------------------------------------------------------------------ exportar
-
-    private fun showExportMenu() {
         AlertDialog.Builder(this)
-            .setTitle("Exportar como imagem")
-            .setItems(arrayOf("Salvar na galeria", "Compartilhar")) { _, which -> export(which == 1) }
+            .setTitle("Escolher cor")
+            .setView(sv)
+            .setPositiveButton("OK") { _, _ -> onPick(current) }
+            .setNegativeButton("Cancelar", null)
             .show()
     }
+
+    // ------------------------------------------------------------------ salvar imagem
 
     private fun renderBoard(): Bitmap {
         val w = boardFrame.width
@@ -729,27 +1092,15 @@ class MainActivity : ComponentActivity() {
         return bmp
     }
 
-    private fun export(share: Boolean) {
+    private fun saveImage() {
         val bmp = renderBoard()
         io.execute {
-            val uri = savePng(bmp)
-            ui.post {
-                if (uri == null) {
-                    toast("Falha ao salvar a imagem")
-                } else if (share) {
-                    val i = Intent(Intent.ACTION_SEND)
-                    i.type = "image/png"
-                    i.putExtra(Intent.EXTRA_STREAM, uri)
-                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    startActivity(Intent.createChooser(i, "Compartilhar tier list"))
-                } else {
-                    toast("Salva em Imagens/TierMaker")
-                }
-            }
+            val ok = savePng(bmp)
+            ui.post { toast(if (ok) "Imagem salva em Imagens/TierMaker" else "Falha ao salvar a imagem") }
         }
     }
 
-    private fun savePng(bmp: Bitmap): Uri? {
+    private fun savePng(bmp: Bitmap): Boolean {
         return try {
             val values = ContentValues()
             values.put(MediaStore.Images.Media.DISPLAY_NAME, "tierlist_${System.currentTimeMillis()}.png")
@@ -758,10 +1109,12 @@ class MainActivity : ComponentActivity() {
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             if (uri != null) {
                 contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                true
+            } else {
+                false
             }
-            uri
         } catch (e: Exception) {
-            null
+            false
         }
     }
 }
