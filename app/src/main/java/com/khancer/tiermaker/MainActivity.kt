@@ -3,22 +3,25 @@ package com.khancer.tiermaker
 import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ContentValues
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.ImageDecoder
+import android.graphics.Movie
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
-import android.os.Handler
-import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.view.DragEvent
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.CheckBox
@@ -28,32 +31,33 @@ import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.widget.doAfterTextChanged
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
+import java.util.concurrent.CountDownLatch
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
-private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
-private const val ACCENT = 0xFFFF8A3D.toInt()
+private class AnimSrc(val movie: Movie, val dur: Int)
+private class Live(val view: ImageView, val id: String, val bmp: Bitmap, val canvas: Canvas)
+private class Loaded(val bmp: Bitmap, val gif: ByteArray?, val mw: Int)
 
-class MainActivity : ComponentActivity() {
+/** Editor de uma lista. */
+@Suppress("DEPRECATION")
+class MainActivity : BaseActivity() {
 
+    private lateinit var listId: String
     private lateinit var state: TierState
     private val cache = ConcurrentHashMap<String, Bitmap>()
-    private val io = Executors.newSingleThreadExecutor()
-    private val ui = Handler(Looper.getMainLooper())
     private var bgBitmap: Bitmap? = null
 
     private lateinit var scroll: AutoScrollView
@@ -65,12 +69,19 @@ class MainActivity : ComponentActivity() {
     private lateinit var poolFlow: FlowLayout
     private lateinit var poolHeader: TextView
 
+    // animação (GIFs sincronizados)
+    private val sources = HashMap<String, AnimSrc>()
+    private val badSources = HashSet<String>()
+    private val live = ArrayList<Live>()
+    private var cycleMs = 0
+    private var t0 = 0L
+
     /** Chamado quando uma imagem escolhida (tier ou título) termina de ser importada. */
     private var pendingCb: ((String) -> Unit)? = null
 
     private val pickImages =
         registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
-            if (uris.isNotEmpty()) importImages(uris)
+            if (uris.isNotEmpty()) processQueue(uris, 0, ArrayList(), false)
         }
     private val pickBg =
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -78,31 +89,35 @@ class MainActivity : ComponentActivity() {
         }
     private val pickLabel =
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-            if (uri != null) importPicked(uri, true)
+            if (uri != null) importLabel(uri)
         }
     private val pickTitleImg =
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-            if (uri != null) importPicked(uri, false)
+            if (uri != null) importTitleImage(uri)
         }
 
-    private val stateFile: File get() = File(filesDir, "state.json")
-    private val bgFile: File get() = File(filesDir, "bg.jpg")
-    private val imgDir: File
-        get() {
-            val d = File(filesDir, "imgs")
-            d.mkdirs()
-            return d
+    private val ticker = object : Runnable {
+        override fun run() {
+            renderLive()
+            ui.postDelayed(this, (1000 / max(1, AppSettings.animFps)).toLong())
         }
+    }
 
     // ------------------------------------------------------------------ ciclo de vida
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        state = loadState()
+        val id = intent.getStringExtra("listId")
+        if (id == null) {
+            finish()
+            return
+        }
+        listId = id
+        state = Store.load(this, id) ?: TierState.default()
 
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.BLACK)
+        root.setBackgroundColor(AppSettings.bgColor)
         root.addView(buildTopBar(), LinearLayout.LayoutParams(MATCH, WRAP))
 
         scroll = AutoScrollView(this)
@@ -145,8 +160,9 @@ class MainActivity : ComponentActivity() {
         root.addView(buildBottomBar(), LinearLayout.LayoutParams(MATCH, WRAP))
         setContentView(root)
 
-        if (state.hasBgImage && bgFile.exists()) {
-            bgBitmap = BitmapFactory.decodeFile(bgFile.path)
+        val bg = Store.bgFile(this, listId)
+        if (state.hasBgImage && bg.exists()) {
+            bgBitmap = BitmapFactory.decodeFile(bg.path)
         }
         rebuild()
 
@@ -157,123 +173,41 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ------------------------------------------------------------------ helpers de UI
-
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).roundToInt()
-
-    private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
-
-    private fun label(text: String, size: Float = 14f, bold: Boolean = false): TextView {
-        val t = TextView(this)
-        t.text = text
-        t.textSize = size
-        if (bold) t.setTypeface(Typeface.DEFAULT_BOLD)
-        return t
+    override fun onResume() {
+        super.onResume()
+        ui.removeCallbacks(ticker)
+        ui.post(ticker)
     }
 
-    private fun button(text: String, onClick: () -> Unit): Button {
-        val b = Button(this)
-        b.text = text
-        b.isAllCaps = false
-        b.minWidth = 0
-        b.minimumWidth = 0
-        b.setOnClickListener { onClick() }
-        return b
+    override fun onPause() {
+        super.onPause()
+        ui.removeCallbacks(ticker)
     }
 
-    private fun hbox(): LinearLayout {
-        val l = LinearLayout(this)
-        l.orientation = LinearLayout.HORIZONTAL
-        l.gravity = Gravity.CENTER_VERTICAL
-        return l
-    }
+    private fun save() = Store.save(this, listId, state)
 
-    private fun vbox(): LinearLayout {
-        val l = LinearLayout(this)
-        l.orientation = LinearLayout.VERTICAL
-        return l
-    }
-
-    private fun dialogBox(): LinearLayout {
-        val b = vbox()
-        b.setPadding(dp(16), dp(8), dp(16), dp(8))
-        return b
-    }
-
-    private fun swatch(color: Int, onClick: () -> Unit): View {
-        val v = View(this)
-        val g = GradientDrawable()
-        g.shape = GradientDrawable.RECTANGLE
-        g.cornerRadius = dp(8).toFloat()
-        g.setColor(color)
-        g.setStroke(dp(2), Color.GRAY)
-        v.background = g
-        v.setOnClickListener { onClick() }
-        return v
-    }
-
-    private fun section(text: String): TextView {
-        val t = label(text, 15f, true)
-        t.setTextColor(ACCENT)
-        t.setPadding(0, dp(16), 0, dp(4))
-        return t
-    }
-
-    /** Linha "nome + quadradinho de cor". O quadradinho se atualiza sozinho ao escolher. */
-    private fun colorRow(text: String, getColor: () -> Int, onPick: (Int) -> Unit): View {
-        val r = hbox()
-        r.setPadding(0, dp(4), 0, dp(4))
-        r.addView(label(text, 15f), LinearLayout.LayoutParams(0, WRAP, 1f))
-        val sw = swatch(getColor()) {}
-        sw.setOnClickListener {
-            pickColor(getColor()) { c ->
-                onPick(c)
-                (sw.background as GradientDrawable).setColor(c)
-            }
-        }
-        r.addView(sw, LinearLayout.LayoutParams(dp(48), dp(36)))
-        return r
-    }
-
-    private fun addSeek(
-        box: LinearLayout, title: String, unit: String,
-        minV: Int, maxV: Int, value: Int, live: Boolean, onChange: (Int) -> Unit
-    ) {
-        val lbl = label("$title: $value $unit", 14f)
-        val sb = SeekBar(this)
-        sb.max = maxV - minV
-        sb.progress = (value - minV).coerceIn(0, maxV - minV)
-        sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                lbl.text = "$title: ${minV + p} $unit"
-                if (live && fromUser) onChange(minV + p)
-            }
-            override fun onStartTrackingTouch(s: SeekBar?) {}
-            override fun onStopTrackingTouch(s: SeekBar?) {
-                if (!live) onChange(minV + (s?.progress ?: 0))
-            }
-        })
-        box.addView(lbl)
-        box.addView(sb)
-    }
+    // ------------------------------------------------------------------ barras
 
     private fun buildTopBar(): View {
-        val bar = LinearLayout(this)
-        bar.orientation = LinearLayout.HORIZONTAL
-        bar.setBackgroundColor(0xFF1A1A1A.toInt())
+        val bar = hbox()
+        bar.setBackgroundColor(AppSettings.panelColor)
         bar.setPadding(dp(4), dp(4), dp(4), dp(4))
-        bar.addView(button("Salvar imagem") { saveImage() }, LinearLayout.LayoutParams(MATCH, WRAP))
+        bar.addView(button("← Listas") { finish() }, LinearLayout.LayoutParams(WRAP, WRAP))
+        val lp = LinearLayout.LayoutParams(0, WRAP, 1f)
+        lp.leftMargin = dp(6)
+        bar.addView(button("Salvar imagem") { saveImage() }, lp)
         return bar
     }
 
     private fun buildPool(): View {
         val panel = LinearLayout(this)
         panel.orientation = LinearLayout.VERTICAL
-        panel.setBackgroundColor(0xFF1A1A1A.toInt())
+        panel.setBackgroundColor(AppSettings.panelColor)
         panel.setPadding(dp(8), dp(6), dp(8), dp(6))
 
         poolHeader = TextView(this)
-        poolHeader.setTextColor(Color.LTGRAY)
+        poolHeader.setTextColor(AppSettings.textColor)
+        poolHeader.alpha = 0.75f
         poolHeader.textSize = 13f
 
         val sv = ScrollView(this)
@@ -287,10 +221,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun buildBottomBar(): View {
-        val bar = LinearLayout(this)
-        bar.orientation = LinearLayout.HORIZONTAL
-        bar.gravity = Gravity.CENTER_VERTICAL
-        bar.setBackgroundColor(0xFF1A1A1A.toInt())
+        val bar = hbox()
+        bar.setBackgroundColor(AppSettings.panelColor)
         bar.setPadding(dp(4), dp(4), dp(4), dp(4))
         bar.addView(button("Adicionar imagens") { pickImages.launch("image/*") }, LinearLayout.LayoutParams(0, WRAP, 1f))
 
@@ -333,6 +265,7 @@ class MainActivity : ComponentActivity() {
     // ------------------------------------------------------------------ montagem da lista
 
     private fun rebuild() {
+        live.clear()
         boardFrame.setBackgroundColor(state.bgColor)
         bgView.bitmap = bgBitmap
         refreshTitle()
@@ -341,8 +274,17 @@ class MainActivity : ComponentActivity() {
         for (tier in state.tiers) tiersBox.addView(buildTierRow(tier))
 
         poolFlow.removeAllViews()
-        for (id in state.pool) poolFlow.addView(makeIcon(id, dp(state.iconDp)))
+        for (id in state.pool) poolFlow.addView(makeIcon(id, dp(state.iconDp), 256))
         poolHeader.text = "Sem tier (${state.pool.size}) - segure uma imagem e arraste"
+
+        var maxDur = 0
+        for (l in live) {
+            val s = getSource(l.id)
+            if (s != null) maxDur = max(maxDur, s.dur)
+        }
+        cycleMs = if (maxDur == 0) 0 else min(max(maxDur, 500), 15000)
+        t0 = SystemClock.uptimeMillis()
+        if (cycleMs > 0) renderLiveAt(0)
     }
 
     private fun titleTypeface(): Typeface {
@@ -393,14 +335,15 @@ class MainActivity : ComponentActivity() {
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
 
+        // Barra lateral: a imagem do tier é sempre um quadrado 1x1 (do tamanho dos ícones),
+        // posicionado no topo; o tier cresce com as linhas, a imagem não estica.
         val labelBox = FrameLayout(this)
         labelBox.setBackgroundColor(tier.color)
         val labelId = tier.labelImage
-        val labelBmp = if (labelId != null) getBitmap(labelId) else null
-        if (labelBmp != null) {
-            val cover = CoverView(this)
-            cover.bitmap = labelBmp
-            labelBox.addView(cover, FrameLayout.LayoutParams(MATCH, MATCH))
+        var hasImg = false
+        if (labelId != null && Store.png(this, labelId).exists()) {
+            hasImg = true
+            labelBox.addView(makeIcon(labelId, cell, 384, false), FrameLayout.LayoutParams(cell, cell))
         }
         if (tier.name.isNotBlank()) {
             val name = TextView(this)
@@ -410,15 +353,20 @@ class MainActivity : ComponentActivity() {
             name.setTypeface(Typeface.DEFAULT_BOLD)
             name.setTextColor(state.tierTextColor)
             name.setPadding(dp(4), dp(4), dp(4), dp(4))
-            if (labelBmp != null) name.setShadowLayer(6f, 0f, 0f, Color.BLACK)
-            labelBox.addView(name, FrameLayout.LayoutParams(MATCH, MATCH))
+            if (hasImg) {
+                name.setShadowLayer(6f, 0f, 0f, Color.BLACK)
+                labelBox.addView(name, FrameLayout.LayoutParams(cell, cell))
+            } else {
+                labelBox.addView(name, FrameLayout.LayoutParams(MATCH, MATCH))
+            }
         }
-        row.addView(labelBox, LinearLayout.LayoutParams(max(cell, dp(80)), MATCH))
+        val labelW = if (hasImg) cell else max(cell, dp(80))
+        row.addView(labelBox, LinearLayout.LayoutParams(labelW, MATCH))
 
         val flow = FlowLayout(this)
         flow.setBackgroundColor(state.areaColor)
         flow.minimumHeight = tier.rows * cell
-        for (id in tier.items) flow.addView(makeIcon(id, cell))
+        for (id in tier.items) flow.addView(makeIcon(id, cell, 256))
         row.addView(flow, LinearLayout.LayoutParams(0, WRAP, 1f))
 
         row.setOnDragListener(makeDropListener(tier.items, flow))
@@ -430,25 +378,71 @@ class MainActivity : ComponentActivity() {
         return row
     }
 
-    /** Todo ícone é uma célula quadrada (1x1) com a imagem em center-crop. */
-    private fun makeIcon(id: String, cell: Int): View {
+    /**
+     * Todo ícone é uma célula quadrada (1x1). Toque rápido = menu; segurar um instante e
+     * mover = arrastar (sem abrir o menu).
+     */
+    private fun makeIcon(id: String, cell: Int, outSize: Int, interactive: Boolean = true): View {
         val iv = ImageView(this)
         iv.scaleType = ImageView.ScaleType.CENTER_CROP
         iv.layoutParams = ViewGroup.LayoutParams(cell, cell)
-        val bmp = getBitmap(id)
-        if (bmp != null) iv.setImageBitmap(bmp)
-        iv.setOnClickListener { showItemMenu(id) }
-        iv.setOnLongClickListener { v ->
-            v.startDragAndDrop(ClipData.newPlainText("id", id), View.DragShadowBuilder(v), null, 0)
-            true
+        val staticBmp = getBitmap(id)
+        val animated = AppSettings.animEnabled && state.anims.containsKey(id) && getSource(id) != null
+        if (animated) {
+            val target = Bitmap.createBitmap(outSize, outSize, Bitmap.Config.ARGB_8888)
+            val c = Canvas(target)
+            if (staticBmp != null) c.drawBitmap(staticBmp, null, Rect(0, 0, outSize, outSize), null)
+            iv.setImageBitmap(target)
+            live.add(Live(iv, id, target, c))
+        } else if (staticBmp != null) {
+            iv.setImageBitmap(staticBmp)
         }
+
+        if (!interactive) return iv
+
+        iv.setOnClickListener { showItemMenu(id) }
+
+        val slop = ViewConfiguration.get(this).scaledTouchSlop.toFloat()
+        iv.setOnTouchListener(object : View.OnTouchListener {
+            private var downX = 0f
+            private var downY = 0f
+            private var starter: Runnable? = null
+
+            private fun cancel(v: View) {
+                val r = starter
+                if (r != null) v.removeCallbacks(r)
+                starter = null
+            }
+
+            override fun onTouch(v: View, e: MotionEvent): Boolean {
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        downX = e.rawX
+                        downY = e.rawY
+                        cancel(v)
+                        val r = Runnable {
+                            starter = null
+                            v.parent?.requestDisallowInterceptTouchEvent(true)
+                            v.startDragAndDrop(ClipData.newPlainText("id", id), View.DragShadowBuilder(v), null, 0)
+                        }
+                        starter = r
+                        v.postDelayed(r, 220)
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        if (hypot(e.rawX - downX, e.rawY - downY) > slop) cancel(v)
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> cancel(v)
+                }
+                return false
+            }
+        })
         return iv
     }
 
     private fun getBitmap(id: String): Bitmap? {
         val cached = cache[id]
         if (cached != null) return cached
-        val f = File(imgDir, "$id.png")
+        val f = Store.png(this, id)
         if (!f.exists()) return null
         val b = BitmapFactory.decodeFile(f.path) ?: return null
         cache[id] = b
@@ -457,7 +451,77 @@ class MainActivity : ComponentActivity() {
 
     private fun deleteImage(id: String) {
         cache.remove(id)
-        File(imgDir, "$id.png").delete()
+        sources.remove(id)
+        state.anims.remove(id)
+        Store.deleteImage(this, id)
+    }
+
+    // ------------------------------------------------------------------ animação (GIFs sincronizados)
+
+    private fun getSource(id: String): AnimSrc? {
+        val cached = sources[id]
+        if (cached != null) return cached
+        if (badSources.contains(id)) return null
+        val f = Store.gif(this, id)
+        if (!f.exists()) {
+            badSources.add(id)
+            return null
+        }
+        return try {
+            val bytes = f.readBytes()
+            val m = Movie.decodeByteArray(bytes, 0, bytes.size)
+            if (m != null && m.duration() > 0) {
+                val s = AnimSrc(m, m.duration())
+                sources[id] = s
+                s
+            } else {
+                badSources.add(id)
+                null
+            }
+        } catch (e: Exception) {
+            badSources.add(id)
+            null
+        }
+    }
+
+    /**
+     * Todos os GIFs seguem o mesmo relógio. O ciclo da lista tem a duração do GIF mais longo; cada GIF
+     * repete k vezes (k = ciclo / duração do GIF, arredondado) com velocidade ajustada para fechar o
+     * ciclo exatamente. Assim nenhum congela esperando outro e todos reiniciam juntos.
+     */
+    private fun drawFrame(l: Live, t: Int) {
+        val src = getSource(l.id) ?: return
+        val meta = state.anims[l.id] ?: return
+        val k = max(1, (cycleMs.toFloat() / src.dur).roundToInt())
+        val phase = ((t.toLong() * k) % cycleMs).toFloat() / cycleMs
+        val frameTime = (phase * src.dur).toInt().coerceIn(0, src.dur - 1)
+        src.movie.setTime(frameTime)
+        l.bmp.eraseColor(Color.TRANSPARENT)
+        val c = l.canvas
+        c.save()
+        val sc = l.bmp.width.toFloat() / max(1, meta.size)
+        c.scale(sc, sc)
+        c.translate(-meta.cx.toFloat(), -meta.cy.toFloat())
+        src.movie.draw(c, 0f, 0f)
+        c.restore()
+    }
+
+    private fun renderLive() {
+        if (live.isEmpty() || cycleMs <= 0) return
+        val t = ((SystemClock.uptimeMillis() - t0) % cycleMs).toInt()
+        val r = Rect()
+        for (l in live) {
+            if (!l.view.isShown || !l.view.getLocalVisibleRect(r)) continue
+            drawFrame(l, t)
+            l.view.invalidate()
+        }
+    }
+
+    private fun renderLiveAt(t: Int) {
+        for (l in live) {
+            drawFrame(l, t)
+            l.view.invalidate()
+        }
     }
 
     // ------------------------------------------------------------------ arrastar e soltar
@@ -511,14 +575,14 @@ class MainActivity : ComponentActivity() {
             if (src === target && old < i) i--
         }
         target.add(i.coerceIn(0, target.size), id)
-        saveState()
+        save()
         rebuild()
     }
 
     private fun removeItem(id: String) {
         findList(id)?.remove(id)
         deleteImage(id)
-        saveState()
+        save()
         rebuild()
     }
 
@@ -538,77 +602,131 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
-    // ------------------------------------------------------------------ importação de imagens
+    // ------------------------------------------------------------------ importação (com recorte 1x1)
 
-    private fun importImages(uris: List<Uri>) {
-        toast("Importando ${uris.size} imagem(ns)...")
+    private fun isGif(uri: Uri): Boolean {
+        return try {
+            contentResolver.openInputStream(uri)?.use { s ->
+                val h = ByteArray(3)
+                s.read(h) == 3 && h[0] == 'G'.code.toByte() && h[1] == 'I'.code.toByte() && h[2] == 'F'.code.toByte()
+            } ?: false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun loadForCrop(uri: Uri): Loaded {
+        val bmp = decodeFit(uri, 2048)
+        if (AppSettings.animEnabled && isGif(uri)) {
+            val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            if (bytes != null) {
+                val m = Movie.decodeByteArray(bytes, 0, bytes.size)
+                if (m != null && m.duration() > 0) return Loaded(bmp, bytes, m.width())
+            }
+        }
+        return Loaded(bmp, null, 0)
+    }
+
+    /** Salva o recorte quadrado (ou o centro, se rect for nulo). Para GIFs guarda também o original. */
+    private fun saveCropped(l: Loaded, rect: Rect?, outSize: Int): String {
+        val side = min(l.bmp.width, l.bmp.height)
+        val r = rect ?: Rect(
+            (l.bmp.width - side) / 2, (l.bmp.height - side) / 2,
+            (l.bmp.width - side) / 2 + side, (l.bmp.height - side) / 2 + side
+        )
+        val sq = Bitmap.createBitmap(l.bmp, r.left, r.top, r.width(), r.height())
+        val out = if (sq.width != outSize) Bitmap.createScaledBitmap(sq, outSize, outSize, true) else sq
+        val id = UUID.randomUUID().toString()
+        FileOutputStream(Store.png(this, id)).use { out.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        cache[id] = out
+        val gif = l.gif
+        if (gif != null && l.mw > 0) {
+            FileOutputStream(Store.gif(this, id)).use { it.write(gif) }
+            val sx = l.mw.toFloat() / l.bmp.width
+            val cx = (r.left * sx).roundToInt()
+            val cy = (r.top * sx).roundToInt()
+            val size = max(1, (r.width() * sx).roundToInt())
+            state.anims[id] = AnimMeta(cx, cy, size)
+        }
+        return id
+    }
+
+    private fun processQueue(uris: List<Uri>, idx: Int, added: ArrayList<String>, centerAll: Boolean) {
+        if (idx >= uris.size) {
+            state.pool.addAll(added)
+            save()
+            rebuild()
+            return
+        }
         io.execute {
-            val added = ArrayList<String>()
-            for (u in uris) {
-                try {
-                    val bmp = decodeSquare(u, 256)
-                    val id = UUID.randomUUID().toString()
-                    FileOutputStream(File(imgDir, "$id.png")).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
-                    cache[id] = bmp
-                    added.add(id)
-                } catch (e: Exception) {
-                    // ignora imagens que não puderem ser lidas
-                }
+            val loaded = try {
+                loadForCrop(uris[idx])
+            } catch (e: Exception) {
+                null
             }
             ui.post {
-                state.pool.addAll(added)
-                saveState()
-                rebuild()
-                if (added.size < uris.size) toast("Algumas imagens não puderam ser lidas")
+                if (loaded == null) {
+                    toast("Uma imagem não pôde ser lida")
+                    processQueue(uris, idx + 1, added, centerAll)
+                } else if (centerAll) {
+                    added.add(saveCropped(loaded, null, 256))
+                    processQueue(uris, idx + 1, added, true)
+                } else {
+                    val remaining = uris.size - idx
+                    showCropper(loaded.bmp, "Recortar imagem ${idx + 1} de ${uris.size}", remaining > 1) { action, rect ->
+                        when (action) {
+                            0 -> {
+                                added.add(saveCropped(loaded, rect, 256))
+                                processQueue(uris, idx + 1, added, false)
+                            }
+                            1 -> {
+                                added.add(saveCropped(loaded, null, 256))
+                                processQueue(uris, idx + 1, added, false)
+                            }
+                            2 -> {
+                                added.add(saveCropped(loaded, null, 256))
+                                processQueue(uris, idx + 1, added, true)
+                            }
+                            else -> {
+                                state.pool.addAll(added)
+                                save()
+                                rebuild()
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
-    /** Recorta o centro da imagem em formato quadrado (1x1) e reduz para size x size. */
-    private fun decodeSquare(uri: Uri, size: Int): Bitmap {
-        val src = ImageDecoder.createSource(contentResolver, uri)
-        val full = ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
-            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-            val w = info.size.width
-            val h = info.size.height
-            val f = size.toFloat() / min(w, h)
-            if (f < 1f) {
-                decoder.setTargetSize(
-                    max(size, (w * f).roundToInt()),
-                    max(size, (h * f).roundToInt())
-                )
+    private fun importLabel(uri: Uri) {
+        io.execute {
+            val loaded = try {
+                loadForCrop(uri)
+            } catch (e: Exception) {
+                null
             }
-        }
-        val s = min(full.width, full.height)
-        val x = (full.width - s) / 2
-        val y = (full.height - s) / 2
-        val square = Bitmap.createBitmap(full, x, y, s, s)
-        return if (s != size) Bitmap.createScaledBitmap(square, size, size, true) else square
-    }
-
-    /** Mantém a proporção original, só reduzindo se o lado maior passar de maxSide. */
-    private fun decodeFit(uri: Uri, maxSide: Int): Bitmap {
-        val src = ImageDecoder.createSource(contentResolver, uri)
-        return ImageDecoder.decodeBitmap(src) { decoder, info, _ ->
-            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-            val m = max(info.size.width, info.size.height)
-            if (m > maxSide) {
-                val f = maxSide.toFloat() / m
-                decoder.setTargetSize(
-                    max(1, (info.size.width * f).roundToInt()),
-                    max(1, (info.size.height * f).roundToInt())
-                )
+            ui.post {
+                if (loaded == null) {
+                    toast("Não foi possível usar essa imagem")
+                } else {
+                    showCropper(loaded.bmp, "Recortar imagem do tier", false) { action, rect ->
+                        if (action != 3) {
+                            val id = saveCropped(loaded, if (action == 0) rect else null, 384)
+                            pendingCb?.invoke(id)
+                        }
+                    }
+                }
             }
         }
     }
 
-    /** Imagem do tier (quadrada) ou do título (proporção original); devolve o id via pendingCb. */
-    private fun importPicked(uri: Uri, square: Boolean) {
+    private fun importTitleImage(uri: Uri) {
         io.execute {
             try {
-                val bmp = if (square) decodeSquare(uri, 256) else decodeFit(uri, 1200)
+                val bmp = decodeFit(uri, 1200)
                 val id = UUID.randomUUID().toString()
-                FileOutputStream(File(imgDir, "$id.png")).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                FileOutputStream(Store.png(this, id)).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
                 cache[id] = bmp
                 ui.post { pendingCb?.invoke(id) }
             } catch (e: Exception) {
@@ -621,11 +739,11 @@ class MainActivity : ComponentActivity() {
         io.execute {
             try {
                 val bmp = decodeFit(uri, 1600)
-                FileOutputStream(bgFile).use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+                FileOutputStream(Store.bgFile(this, listId)).use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
                 ui.post {
                     bgBitmap = bmp
                     state.hasBgImage = true
-                    saveState()
+                    save()
                     rebuild()
                 }
             } catch (e: Exception) {
@@ -635,29 +753,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun removeBackground() {
-        bgFile.delete()
+        Store.bgFile(this, listId).delete()
         bgBitmap = null
         state.hasBgImage = false
-        saveState()
+        save()
         rebuild()
-    }
-
-    // ------------------------------------------------------------------ persistência
-
-    private fun loadState(): TierState {
-        return try {
-            if (stateFile.exists()) TierState.fromJson(stateFile.readText()) else TierState.default()
-        } catch (e: Exception) {
-            TierState.default()
-        }
-    }
-
-    private fun saveState() {
-        try {
-            stateFile.writeText(state.toJson())
-        } catch (e: Exception) {
-            // ignora
-        }
     }
 
     // ------------------------------------------------------------------ editar tier (segurar o tier)
@@ -668,7 +768,7 @@ class MainActivity : ComponentActivity() {
         val t = Tier("Novo", c, 1)
         t.iconDp = size
         state.tiers.add(t)
-        saveState()
+        save()
         rebuild()
         showTierEditor(t)
         scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
@@ -679,7 +779,7 @@ class MainActivity : ComponentActivity() {
         val li = t.labelImage
         if (li != null) deleteImage(li)
         state.tiers.remove(t)
-        saveState()
+        save()
         rebuild()
     }
 
@@ -695,7 +795,7 @@ class MainActivity : ComponentActivity() {
         nameEdit.setSingleLine()
         nameEdit.doAfterTextChanged {
             t.name = it?.toString() ?: ""
-            saveState()
+            save()
             rebuild()
         }
         box.addView(nameEdit)
@@ -703,14 +803,14 @@ class MainActivity : ComponentActivity() {
         box.addView(section("Cor do tier"))
         box.addView(colorRow("Cor", { t.color }) {
             t.color = it
-            saveState()
+            save()
             rebuild()
         })
 
         box.addView(section("Imagens neste tier"))
         addSeek(box, "Tamanho dos ícones", "dp", 40, 140, t.iconDp, false) {
             t.iconDp = it
-            saveState()
+            save()
             rebuild()
         }
 
@@ -721,7 +821,7 @@ class MainActivity : ComponentActivity() {
             if (t.rows > 1) {
                 t.rows--
                 rowsLabel.text = " ${t.rows} "
-                saveState()
+                save()
                 rebuild()
             }
         })
@@ -730,13 +830,13 @@ class MainActivity : ComponentActivity() {
             if (t.rows < 8) {
                 t.rows++
                 rowsLabel.text = " ${t.rows} "
-                saveState()
+                save()
                 rebuild()
             }
         })
         box.addView(rowsBox)
 
-        box.addView(section("Imagem do tier (barra lateral)"))
+        box.addView(section("Imagem do tier (quadrada 1x1, do tamanho dos ícones)"))
         val imgInfo = label(if (t.labelImage != null) "Imagem definida" else "Sem imagem", 14f)
         box.addView(imgInfo)
         val imgRow = hbox()
@@ -746,7 +846,7 @@ class MainActivity : ComponentActivity() {
                 t.labelImage = id
                 if (old != null) deleteImage(old)
                 imgInfo.text = "Imagem definida"
-                saveState()
+                save()
                 rebuild()
             }
             pickLabel.launch("image/*")
@@ -757,7 +857,7 @@ class MainActivity : ComponentActivity() {
                 t.labelImage = null
                 deleteImage(old)
                 imgInfo.text = "Sem imagem"
-                saveState()
+                save()
                 rebuild()
             }
         })
@@ -769,7 +869,7 @@ class MainActivity : ComponentActivity() {
             val i = state.tiers.indexOf(t)
             if (i > 0) {
                 Collections.swap(state.tiers, i, i - 1)
-                saveState()
+                save()
                 rebuild()
             }
         })
@@ -777,7 +877,7 @@ class MainActivity : ComponentActivity() {
             val i = state.tiers.indexOf(t)
             if (i >= 0 && i < state.tiers.size - 1) {
                 Collections.swap(state.tiers, i, i + 1)
-                saveState()
+                save()
                 rebuild()
             }
         })
@@ -811,7 +911,7 @@ class MainActivity : ComponentActivity() {
         edit.hint = "Título"
         edit.doAfterTextChanged {
             state.title = it?.toString() ?: ""
-            saveState()
+            save()
             refreshTitle()
         }
         box.addView(edit)
@@ -823,7 +923,7 @@ class MainActivity : ComponentActivity() {
         FONT_NAMES.forEachIndexed { i, n ->
             val b = button(n) {
                 state.titleFont = i
-                saveState()
+                save()
                 refreshTitle()
                 fontBtns.forEachIndexed { j, bb -> bb.alpha = if (j == i) 1f else 0.5f }
             }
@@ -839,7 +939,7 @@ class MainActivity : ComponentActivity() {
         bold.isChecked = state.titleBold
         bold.setOnCheckedChangeListener { _, c ->
             state.titleBold = c
-            saveState()
+            save()
             refreshTitle()
         }
         box.addView(bold)
@@ -847,12 +947,12 @@ class MainActivity : ComponentActivity() {
         box.addView(section("Cor e tamanho"))
         box.addView(colorRow("Cor do texto", { state.titleColor }) {
             state.titleColor = it
-            saveState()
+            save()
             refreshTitle()
         })
         addSeek(box, "Tamanho do texto", "sp", 14, 60, state.titleSize, true) {
             state.titleSize = it
-            saveState()
+            save()
             refreshTitle()
         }
 
@@ -862,7 +962,7 @@ class MainActivity : ComponentActivity() {
         alignNames.forEachIndexed { i, n ->
             alignRow.addView(button(n) {
                 state.titleAlign = i
-                saveState()
+                save()
                 refreshTitle()
             })
         }
@@ -878,7 +978,7 @@ class MainActivity : ComponentActivity() {
                 state.titleImage = id
                 if (old != null) deleteImage(old)
                 imgInfo.text = "Usando imagem"
-                saveState()
+                save()
                 refreshTitle()
             }
             pickTitleImg.launch("image/*")
@@ -889,14 +989,14 @@ class MainActivity : ComponentActivity() {
                 state.titleImage = null
                 deleteImage(old)
                 imgInfo.text = "Usando texto"
-                saveState()
+                save()
                 refreshTitle()
             }
         })
         box.addView(imgRow)
         addSeek(box, "Altura da imagem", "dp", 40, 300, state.titleImageDp, true) {
             state.titleImageDp = it
-            saveState()
+            save()
             refreshTitle()
         }
 
@@ -934,7 +1034,7 @@ class MainActivity : ComponentActivity() {
             for (t in THEMES) {
                 themeRow.addView(button(t.name) {
                     applyTheme(state, t)
-                    saveState()
+                    save()
                     rebuild()
                     render()
                 })
@@ -945,17 +1045,17 @@ class MainActivity : ComponentActivity() {
             box.addView(section("Cores"))
             box.addView(colorRow("Plano de fundo", { state.bgColor }) {
                 state.bgColor = it
-                saveState()
+                save()
                 rebuild()
             })
             box.addView(colorRow("Fonte dos tiers", { state.tierTextColor }) {
                 state.tierTextColor = it
-                saveState()
+                save()
                 rebuild()
             })
             box.addView(colorRow("Área dos tiers", { state.areaColor }) {
                 state.areaColor = it
-                saveState()
+                save()
                 rebuild()
             })
 
@@ -979,108 +1079,13 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
-    private fun pickColor(initial: Int, onPick: (Int) -> Unit) {
-        val box = dialogBox()
-        val sv = ScrollView(this)
-        sv.addView(box)
-
-        var current = initial or 0xFF000000.toInt()
-        var updating = false
-
-        val wheel = ColorWheelView(this)
-        val bright = SeekBar(this)
-        bright.max = 100
-        val hex = EditText(this)
-        hex.hint = "#RRGGBB"
-        hex.setSingleLine()
-        val preview = swatch(current) {}
-
-        // source: 0 = círculo, 1 = brilho, 2 = código hex, 3 = paleta
-        fun refresh(c: Int, source: Int) {
-            updating = true
-            current = c
-            (preview.background as GradientDrawable).setColor(c)
-            if (source != 2) hex.setText(String.format("#%06X", c and 0xFFFFFF))
-            if (source >= 2) {
-                wheel.setColor(c)
-                bright.progress = (wheel.value * 100f).roundToInt()
-            }
-            updating = false
-        }
-
-        wheel.setColor(current)
-        bright.progress = (wheel.value * 100f).roundToInt()
-        hex.setText(String.format("#%06X", current and 0xFFFFFF))
-
-        wheel.onChange = { c -> refresh(c, 0) }
-        bright.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                if (fromUser) {
-                    wheel.value = p / 100f
-                    wheel.invalidate()
-                    refresh(wheel.currentColor(), 1)
-                }
-            }
-            override fun onStartTrackingTouch(s: SeekBar?) {}
-            override fun onStopTrackingTouch(s: SeekBar?) {}
-        })
-        hex.doAfterTextChanged {
-            if (!updating) {
-                val t = it?.toString()?.trim() ?: ""
-                if (t.length == 7 && t[0] == '#') {
-                    try {
-                        refresh(Color.parseColor(t), 2)
-                    } catch (e: Exception) {
-                        // código ainda incompleto ou inválido
-                    }
-                }
-            }
-        }
-
-        val wheelLp = LinearLayout.LayoutParams(dp(240), dp(240))
-        wheelLp.gravity = Gravity.CENTER_HORIZONTAL
-        box.addView(wheel, wheelLp)
-
-        box.addView(label("Brilho (exposição): arraste para escurecer", 13f))
-        box.addView(bright)
-
-        val hexRow = hbox()
-        hexRow.addView(preview, LinearLayout.LayoutParams(dp(48), dp(40)))
-        val hexLp = LinearLayout.LayoutParams(0, WRAP, 1f)
-        hexLp.leftMargin = dp(12)
-        hexRow.addView(hex, hexLp)
-        box.addView(hexRow)
-
-        box.addView(section("Cores rápidas"))
-        val colors = PALETTE.map { Color.parseColor(it) }
-        for (r in 0 until 4) {
-            val row = LinearLayout(this)
-            row.orientation = LinearLayout.HORIZONTAL
-            row.gravity = Gravity.CENTER
-            for (c in 0 until 6) {
-                val col = colors[r * 6 + c]
-                val lp = LinearLayout.LayoutParams(dp(40), dp(40))
-                lp.setMargins(dp(4), dp(4), dp(4), dp(4))
-                row.addView(swatch(col) { refresh(col, 3) }, lp)
-            }
-            box.addView(row)
-        }
-
-        AlertDialog.Builder(this)
-            .setTitle("Escolher cor")
-            .setView(sv)
-            .setPositiveButton("OK") { _, _ -> onPick(current) }
-            .setNegativeButton("Cancelar", null)
-            .show()
-    }
-
     // ------------------------------------------------------------------ salvar imagem
 
-    private fun renderBoard(): Bitmap {
+    private fun renderBoard(forGif: Boolean): Bitmap {
         val w = boardFrame.width
         val h = boardFrame.height
-        var scale = 2f
-        if (h * scale > 9000f || w * scale > 4096f) scale = 1f
+        var scale = if (forGif) min(1f, 720f / w) else 2f
+        if (!forGif && (h * scale > 9000f || w * scale > 4096f)) scale = 1f
         val bmp = Bitmap.createBitmap(
             max(1, (w * scale).toInt()),
             max(1, (h * scale).toInt()),
@@ -1093,20 +1098,37 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun saveImage() {
-        val bmp = renderBoard()
+        if (live.isNotEmpty() && cycleMs > 0) {
+            AlertDialog.Builder(this)
+                .setTitle("Salvar como")
+                .setItems(arrayOf("GIF animado", "Imagem estática (PNG)")) { _, which ->
+                    if (which == 0) exportGif() else savePngAsync()
+                }
+                .show()
+        } else {
+            savePngAsync()
+        }
+    }
+
+    private fun savePngAsync() {
+        val bmp = renderBoard(false)
         io.execute {
             val ok = savePng(bmp)
             ui.post { toast(if (ok) "Imagem salva em Imagens/TierMaker" else "Falha ao salvar a imagem") }
         }
     }
 
+    private fun newMediaUri(name: String, mime: String): Uri? {
+        val values = ContentValues()
+        values.put(MediaStore.Images.Media.DISPLAY_NAME, name)
+        values.put(MediaStore.Images.Media.MIME_TYPE, mime)
+        values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/TierMaker")
+        return contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+    }
+
     private fun savePng(bmp: Bitmap): Boolean {
         return try {
-            val values = ContentValues()
-            values.put(MediaStore.Images.Media.DISPLAY_NAME, "tierlist_${System.currentTimeMillis()}.png")
-            values.put(MediaStore.Images.Media.MIME_TYPE, "image/png")
-            values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/TierMaker")
-            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            val uri = newMediaUri("tierlist_${System.currentTimeMillis()}.png", "image/png")
             if (uri != null) {
                 contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
                 true
@@ -1116,5 +1138,70 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             false
         }
+    }
+
+    private fun renderBoardAt(t: Int): Bitmap? {
+        val latch = CountDownLatch(1)
+        var out: Bitmap? = null
+        ui.post {
+            try {
+                renderLiveAt(t)
+                out = renderBoard(true)
+            } finally {
+                latch.countDown()
+            }
+        }
+        latch.await()
+        return out
+    }
+
+    /** Salva a lista como GIF animado: todos os GIFs no mesmo ciclo e com o mesmo número de quadros. */
+    private fun exportGif() {
+        val fps = max(1, AppSettings.animFps)
+        val total = cycleMs
+        val n = ((total * fps) / 1000f).roundToInt().coerceIn(2, 150)
+        val delayCs = max(2, (total.toFloat() / n / 10f).roundToInt())
+
+        val progress = label("Preparando...", 16f)
+        progress.setPadding(dp(24), dp(20), dp(24), dp(20))
+        val dlg = AlertDialog.Builder(this)
+            .setTitle("Salvando GIF animado")
+            .setView(progress)
+            .setCancelable(false)
+            .create()
+        dlg.show()
+
+        Thread {
+            var ok = false
+            var uri: Uri? = null
+            try {
+                uri = newMediaUri("tierlist_${System.currentTimeMillis()}.gif", "image/gif")
+                val os = BufferedOutputStream(contentResolver.openOutputStream(uri!!)!!)
+                var writer: GifWriter? = null
+                for (i in 0 until n) {
+                    val t = (i.toLong() * total / n).toInt()
+                    val bmp = renderBoardAt(t) ?: throw IllegalStateException("render")
+                    val w = writer ?: GifWriter(os, bmp.width, bmp.height)
+                    writer = w
+                    w.addFrame(bmp, delayCs)
+                    bmp.recycle()
+                    ui.post { progress.text = "Quadro ${i + 1} de $n" }
+                }
+                writer?.finish()
+                os.close()
+                ok = true
+            } catch (e: Exception) {
+                try {
+                    val u = uri
+                    if (u != null) contentResolver.delete(u, null, null)
+                } catch (e2: Exception) {
+                    // ignora
+                }
+            }
+            ui.post {
+                dlg.dismiss()
+                toast(if (ok) "GIF salvo em Imagens/TierMaker" else "Falha ao salvar o GIF")
+            }
+        }.start()
     }
 }

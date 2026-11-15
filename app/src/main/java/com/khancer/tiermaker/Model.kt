@@ -13,6 +13,9 @@ class Tier(
     var iconDp: Int = 64
 )
 
+/** Recorte quadrado (em pixels do GIF original) usado para desenhar um GIF animado como ícone 1x1. */
+class AnimMeta(var cx: Int, var cy: Int, var size: Int)
+
 class Theme(
     val name: String,
     val bg: String,
@@ -60,6 +63,36 @@ class TierState {
     var iconDp = 64 // tamanho dos ícones na área "sem tier"
     val tiers = mutableListOf<Tier>()
     val pool = mutableListOf<String>()
+    val anims = mutableMapOf<String, AnimMeta>()
+
+    fun displayName(): String = if (title.isNotBlank()) title else "Lista sem título"
+
+    fun allImageIds(): List<String> {
+        val set = LinkedHashSet<String>()
+        set.addAll(pool)
+        for (t in tiers) {
+            set.addAll(t.items)
+            val li = t.labelImage
+            if (li != null) set.add(li)
+        }
+        val ti = titleImage
+        if (ti != null) set.add(ti)
+        return set.toList()
+    }
+
+    fun remapIds(m: Map<String, String>) {
+        for (i in pool.indices) pool[i] = m[pool[i]] ?: pool[i]
+        for (t in tiers) {
+            for (i in t.items.indices) t.items[i] = m[t.items[i]] ?: t.items[i]
+            val li = t.labelImage
+            if (li != null) t.labelImage = m[li] ?: li
+        }
+        val ti = titleImage
+        if (ti != null) titleImage = m[ti] ?: ti
+        val copy = HashMap(anims)
+        anims.clear()
+        for ((k, v) in copy) anims[m[k] ?: k] = v
+    }
 
     fun toJson(): String {
         val o = JSONObject()
@@ -89,6 +122,9 @@ class TierState {
         }
         o.put("tiers", ta)
         o.put("pool", JSONArray(pool))
+        val ao = JSONObject()
+        for ((k, v) in anims) ao.put(k, JSONArray(listOf(v.cx, v.cy, v.size)))
+        o.put("anims", ao)
         return o.toString()
     }
 
@@ -138,6 +174,15 @@ class TierState {
             }
             val pa = o.optJSONArray("pool")
             if (pa != null) for (i in 0 until pa.length()) s.pool.add(pa.getString(i))
+            val ao = o.optJSONObject("anims")
+            if (ao != null) {
+                val keys = ao.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val a = ao.getJSONArray(k)
+                    s.anims[k] = AnimMeta(a.getInt(0), a.getInt(1), a.getInt(2))
+                }
+            }
             return s
         }
     }
